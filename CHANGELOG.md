@@ -1,3 +1,9 @@
+## [1.1.0](https://github.com/Stellar-Teye/Teye-Contracts/compare/v1.0.0...v1.1.0) (2026-02-21)
+
+### Features
+
+* implement record versioning and history tracking ([5b6a6ea](https://github.com/Stellar-Teye/Teye-Contracts/commit/5b6a6ea5d2089510641b23e9b9ec8fa1347f0175))
+
 ## 1.0.0 (2026-02-21)
 
 ### Features
