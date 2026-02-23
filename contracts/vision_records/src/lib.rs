@@ -19,18 +19,24 @@ const INITIALIZED: Symbol = symbol_short!("INIT");
 const TTL_THRESHOLD: u32 = 5184000;
 const TTL_EXTEND_TO: u32 = 10368000;
 
+/// Extends the time-to-live (TTL) for a storage key containing an Address.
+/// This ensures the data remains accessible for the extended period.
 fn extend_ttl_address_key(env: &Env, key: &(Symbol, Address)) {
     env.storage()
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
+/// Extends the time-to-live (TTL) for a storage key containing a u64 value.
+/// This ensures the data remains accessible for the extended period.
 fn extend_ttl_u64_key(env: &Env, key: &(Symbol, u64)) {
     env.storage()
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
+/// Extends the time-to-live (TTL) for an access grant storage key.
+/// This ensures access grant data remains accessible for the extended period.
 fn extend_ttl_access_key(env: &Env, key: &(Symbol, Address, Address)) {
     env.storage()
         .persistent()
@@ -43,9 +49,13 @@ pub use rbac::{Permission, Role};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessLevel {
+    /// No access to the record
     None,
+    /// Read-only access to the record
     Read,
+    /// Write access to the record
     Write,
+    /// Full access including read, write, and delete
     Full,
 }
 
@@ -53,11 +63,17 @@ pub enum AccessLevel {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordType {
+    /// Eye examination record
     Examination,
+    /// Prescription record
     Prescription,
+    /// Diagnosis record
     Diagnosis,
+    /// Treatment record
     Treatment,
+    /// Surgery record
     Surgery,
+    /// Laboratory result record
     LabResult,
 }
 
@@ -387,6 +403,8 @@ impl VisionRecordsContract {
 
     // ======================== RBAC Endpoints ========================
 
+    /// Grants a custom permission to a user.
+    /// Requires the caller to have ManageUsers permission.
     pub fn grant_custom_permission(
         env: Env,
         caller: Address,
@@ -402,6 +420,8 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Revokes a custom permission from a user.
+    /// Requires the caller to have ManageUsers permission.
     pub fn revoke_custom_permission(
         env: Env,
         caller: Address,
@@ -417,6 +437,8 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Delegates a role to another user with an expiration timestamp.
+    /// The delegator must authenticate the transaction.
     pub fn delegate_role(
         env: Env,
         delegator: Address,
@@ -429,10 +451,15 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Checks if a user has a specific permission.
+    /// Returns true if the user has the permission, false otherwise.
     pub fn check_permission(env: Env, user: Address, permission: Permission) -> bool {
         rbac::has_permission(&env, &user, &permission)
     }
 
+    /// Registers a new healthcare provider in the system.
+    /// Requires the caller to have ManageUsers permission.
+    /// Returns the provider ID assigned to the new provider.
     #[allow(clippy::too_many_arguments)]
     pub fn register_provider(
         env: Env,
@@ -501,6 +528,9 @@ impl VisionRecordsContract {
         Ok(provider_id)
     }
 
+    /// Verifies or updates the verification status of a provider.
+    /// Requires the caller to have ManageUsers permission.
+    /// Cannot set status to Pending.
     pub fn verify_provider(
         env: Env,
         caller: Address,
@@ -531,6 +561,8 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Updates provider information including name, licenses, specialties, certifications, and locations.
+    /// The provider can update their own information, or users with ManageUsers permission can update any provider.
     #[allow(clippy::too_many_arguments)]
     pub fn update_provider(
         env: Env,
@@ -584,6 +616,8 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Retrieves provider information by address.
+    /// Returns the provider data if found, or an error if the provider is not registered.
     pub fn get_provider(env: Env, provider: Address) -> Result<Provider, ContractError> {
         if let Some(provider_data) = provider::get_provider(&env, &provider) {
             Ok(provider_data)
@@ -607,10 +641,14 @@ impl VisionRecordsContract {
         }
     }
 
+    /// Searches for providers by specialty.
+    /// Returns a vector of provider addresses matching the specified specialty.
     pub fn search_providers_by_specialty(env: Env, specialty: String) -> Vec<Address> {
         provider::get_providers_by_specialty(&env, &specialty)
     }
 
+    /// Searches for providers by verification status.
+    /// Returns a vector of active provider addresses with the specified verification status.
     pub fn search_providers_by_status(env: Env, status: VerificationStatus) -> Vec<Address> {
         let all_ids = provider::get_all_provider_ids(&env);
         let mut result = Vec::new(&env);
@@ -632,23 +670,31 @@ impl VisionRecordsContract {
         result
     }
 
+    /// Returns the total number of registered providers in the system.
     pub fn get_provider_count(env: Env) -> u64 {
         provider::get_provider_counter(&env)
     }
 
+    /// Retrieves a provider address by provider ID.
+    /// Returns None if the provider ID does not exist.
     fn get_provider_address_by_id(env: &Env, provider_id: u64) -> Option<Address> {
         let id_key = (symbol_short!("PROV_ID"), provider_id);
         env.storage().persistent().get(&id_key)
     }
 
+    /// Retrieves the complete error log containing all logged errors.
+    /// The log is limited to the most recent 100 entries.
     pub fn get_error_log(env: Env) -> Vec<ErrorLogEntry> {
         errors::get_error_log(&env)
     }
 
+    /// Returns the total count of errors that have been logged since contract initialization.
     pub fn get_error_count(env: Env) -> u64 {
         errors::get_error_count(&env)
     }
 
+    /// Clears the error log and resets the error count.
+    /// Requires the caller to have SystemAdmin permission.
     pub fn clear_error_log(env: Env, caller: Address) -> Result<(), ContractError> {
         caller.require_auth();
         if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
@@ -673,6 +719,9 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Checks if an operation can be retried based on the current retry count.
+    /// Returns true if the operation can be retried, false if max retries have been reached.
+    /// Max retries must be between 1 and 10.
     pub fn retry_operation(
         env: Env,
         caller: Address,
@@ -705,6 +754,8 @@ impl VisionRecordsContract {
         ))
     }
 
+    /// Resets the retry count for a specific operation and caller.
+    /// This allows the operation to be retried from the beginning.
     pub fn reset_retry_count(env: Env, caller: Address, operation: String) {
         errors::reset_retry_count(&env, &caller, &operation);
     }

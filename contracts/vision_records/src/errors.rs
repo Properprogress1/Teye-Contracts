@@ -5,26 +5,39 @@ pub const ERROR_LOG_KEY: Symbol = symbol_short!("ERR_LOG");
 pub const ERROR_COUNT_KEY: Symbol = symbol_short!("ERR_CNT");
 pub const MAX_ERROR_LOG_SIZE: u32 = 100;
 
+/// Error categories for classifying different types of errors
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ErrorCategory {
+    /// Validation errors: invalid input parameters or format errors
     Validation = 1,
+    /// Authorization errors: permission and access control failures
     Authorization = 2,
+    /// Not found errors: resource lookup failures
     NotFound = 3,
+    /// State conflict errors: duplicate registrations, expired delegations
     StateConflict = 4,
+    /// Storage errors: storage operation failures
     Storage = 5,
+    /// Transient errors: temporary failures that may succeed on retry
     Transient = 6,
+    /// System errors: contract-level issues like pausing
     System = 7,
 }
 
+/// Error severity levels indicating the impact and urgency of errors
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ErrorSeverity {
+    /// Low severity: non-critical errors, informational
     Low = 1,
+    /// Medium severity: important but recoverable errors
     Medium = 2,
+    /// High severity: significant errors requiring attention
     High = 3,
+    /// Critical severity: system-level failures requiring immediate action
     Critical = 4,
 }
 
@@ -80,6 +93,8 @@ pub enum ContractError {
 }
 
 impl ContractError {
+    /// Returns the error category for this error.
+    /// Categories help classify errors for better error handling and monitoring.
     pub fn category(&self) -> ErrorCategory {
         match self {
             ContractError::NotInitialized
@@ -110,6 +125,8 @@ impl ContractError {
         }
     }
 
+    /// Returns the severity level for this error.
+    /// Severity levels indicate the impact and urgency of the error.
     pub fn severity(&self) -> ErrorSeverity {
         match self {
             ContractError::NotInitialized
@@ -138,6 +155,8 @@ impl ContractError {
         }
     }
 
+    /// Returns whether this error is retryable.
+    /// Retryable errors indicate transient failures that may succeed on retry.
     pub fn retryable(&self) -> bool {
         matches!(
             self,
@@ -147,6 +166,8 @@ impl ContractError {
         )
     }
 
+    /// Returns a human-readable error message for this error.
+    /// Messages provide context about what went wrong.
     pub fn message(&self) -> &'static str {
         match self {
             ContractError::NotInitialized => "Contract has not been initialized",
@@ -178,6 +199,9 @@ impl ContractError {
     }
 }
 
+/// Logs an error to the contract's error log.
+/// Errors are stored with full context including category, severity, message, user, resource ID, and timestamp.
+/// The error log is limited to the most recent 100 entries.
 pub fn log_error(
     env: &Env,
     error: ContractError,
@@ -227,6 +251,8 @@ pub fn log_error(
         .set(&ERROR_COUNT_KEY, &(error_count + 1));
 }
 
+/// Retrieves the complete error log containing all logged errors.
+/// Returns an empty vector if no errors have been logged.
 pub fn get_error_log(env: &Env) -> Vec<ErrorLogEntry> {
     env.storage()
         .instance()
@@ -234,15 +260,21 @@ pub fn get_error_log(env: &Env) -> Vec<ErrorLogEntry> {
         .unwrap_or(Vec::new(env))
 }
 
+/// Returns the total count of errors that have been logged.
+/// This count persists even if the error log is cleared.
 pub fn get_error_count(env: &Env) -> u64 {
     env.storage().instance().get(&ERROR_COUNT_KEY).unwrap_or(0)
 }
 
+/// Clears the error log and resets the error count to zero.
+/// This operation cannot be undone.
 pub fn clear_error_log(env: &Env) {
     env.storage().instance().remove(&ERROR_LOG_KEY);
     env.storage().instance().set(&ERROR_COUNT_KEY, &0u64);
 }
 
+/// Creates an ErrorContext structure from an error and optional user/resource information.
+/// The context includes automatically determined category, severity, message, and retryable flag.
 pub fn create_error_context(
     env: &Env,
     error: ContractError,
@@ -262,6 +294,9 @@ pub fn create_error_context(
 
 const RETRY_COUNT_KEY: Symbol = symbol_short!("RETRY_CNT");
 
+/// Checks if an operation can be retried based on the current retry count.
+/// Returns true if the operation can be retried, false if max retries have been reached.
+/// Increments the retry count for the caller and operation combination.
 pub fn retry_operation(env: &Env, caller: &Address, operation: &String, max_retries: u32) -> bool {
     let key = (RETRY_COUNT_KEY, caller.clone(), operation.clone());
     let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
@@ -274,6 +309,8 @@ pub fn retry_operation(env: &Env, caller: &Address, operation: &String, max_retr
     true
 }
 
+/// Resets the retry count for a specific caller and operation.
+/// This allows the operation to be retried from the beginning.
 pub fn reset_retry_count(env: &Env, caller: &Address, operation: &String) {
     let key = (RETRY_COUNT_KEY, caller.clone(), operation.clone());
     env.storage().instance().remove(&key);
