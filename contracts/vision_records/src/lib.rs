@@ -1,17 +1,25 @@
 #![no_std]
+mod events;
 pub mod rbac;
 pub mod validation;
 
 pub mod errors;
 pub mod events;
+pub mod examination;
 pub mod provider;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    Symbol, Vec,
 };
 
 pub use errors::{
     create_error_context, log_error, ContractError, ErrorCategory, ErrorLogEntry, ErrorSeverity,
+};
+pub use examination::{
+    EyeExamination, FundusPhotography, IntraocularPressure, OptFundusPhotography,
+    OptPhysicalMeasurement, OptRetinalImaging, OptVisualField, PhysicalMeasurement, RetinalImaging,
+    SlitLampFindings, VisualAcuity, VisualField,
 };
 pub use provider::{Certification, License, Location, Provider, VerificationStatus};
 
@@ -115,6 +123,39 @@ pub struct AccessGrant {
     pub expires_at: u64,
 }
 
+/// Input for batch record creation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecordInput {
+    pub patient: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+}
+
+/// Input for batch access grants
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchGrantInput {
+    pub grantee: Address,
+    pub level: AccessLevel,
+    pub duration_seconds: u64,
+}
+
+/// Contract errors
+#[contracterror]
+#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[repr(u32)]
+pub enum ContractError {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    Unauthorized = 3,
+    UserNotFound = 4,
+    RecordNotFound = 5,
+    InvalidInput = 6,
+    AccessDenied = 7,
+    Paused = 8,
+}
+
 #[contract]
 pub struct VisionRecordsContract;
 
@@ -133,6 +174,9 @@ impl VisionRecordsContract {
         rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
 
         // Bootstrap the admin with the Admin role so they can register other users
+        rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
+
+        // Assign the Admin RBAC role so the admin has permissions
         rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
 
         events::publish_initialized(&env, admin);
@@ -161,6 +205,10 @@ impl VisionRecordsContract {
         role: Role,
         name: String,
     ) -> Result<(), ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REG_USR")),
+        )?;
         caller.require_auth();
 
         if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
@@ -200,6 +248,9 @@ impl VisionRecordsContract {
         rbac::assign_role(&env, user.clone(), role.clone(), 0);
 
         // Assign the role in the RBAC system
+        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+
+        // Create the RBAC role assignment so has_permission works
         rbac::assign_role(&env, user.clone(), role.clone(), 0);
 
         events::publish_user_registered(&env, user, role, name);
@@ -242,6 +293,10 @@ impl VisionRecordsContract {
         record_type: RecordType,
         data_hash: String,
     ) -> Result<u64, ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
         caller.require_auth();
 
         validation::validate_data_hash(&data_hash)?;
@@ -288,9 +343,77 @@ impl VisionRecordsContract {
             .set(&patient_key, &patient_records);
         extend_ttl_address_key(&env, &patient_key);
 
-        events::publish_record_added(&env, record_id, patient, provider, record_type);
-
         Ok(record_id)
+    }
+
+    /// Add multiple vision records in a single transaction.
+    /// Validates provider permission once, then creates all records atomically.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn add_records(
+        env: Env,
+        provider: Address,
+        records: Vec<BatchRecordInput>,
+    ) -> Result<Vec<u64>, ContractError> {
+        provider.require_auth();
+
+        if records.is_empty() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Check provider has WriteRecord permission once for the whole batch
+        if !rbac::has_permission(&env, &provider, &Permission::WriteRecord)
+            && !rbac::has_permission(&env, &provider, &Permission::SystemAdmin)
+        {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let counter_key = symbol_short!("REC_CTR");
+        let mut current_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
+        let mut record_ids = Vec::new(&env);
+
+        for input in records.iter() {
+            current_id += 1;
+
+            let record = VisionRecord {
+                id: current_id,
+                patient: input.patient.clone(),
+                provider: provider.clone(),
+                record_type: input.record_type.clone(),
+                data_hash: input.data_hash.clone(),
+                created_at: env.ledger().timestamp(),
+                updated_at: env.ledger().timestamp(),
+            };
+
+            let key = (symbol_short!("RECORD"), current_id);
+            env.storage().persistent().set(&key, &record);
+
+            let patient_key = (symbol_short!("PAT_REC"), input.patient.clone());
+            let mut patient_records: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&patient_key)
+                .unwrap_or(Vec::new(&env));
+            patient_records.push_back(current_id);
+            env.storage()
+                .persistent()
+                .set(&patient_key, &patient_records);
+
+            events::publish_record_added(
+                &env,
+                current_id,
+                input.patient.clone(),
+                provider.clone(),
+                input.record_type.clone(),
+            );
+
+            record_ids.push_back(current_id);
+        }
+
+        env.storage().instance().set(&counter_key, &current_id);
+
+        events::publish_batch_records_added(&env, provider, record_ids.len());
+
+        Ok(record_ids)
     }
 
     /// Get a vision record by ID
@@ -318,6 +441,86 @@ impl VisionRecordsContract {
         }
     }
 
+    /// Add eye examination details for an existing record
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+        visual_acuity: VisualAcuity,
+        iop: IntraocularPressure,
+        slit_lamp: SlitLampFindings,
+        visual_field: OptVisualField,
+        retina_imaging: OptRetinalImaging,
+        fundus_photo: OptFundusPhotography,
+        clinical_notes: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.provider {
+            rbac::has_permission(&env, &caller, &Permission::WriteRecord)
+        } else {
+            rbac::has_delegated_permission(
+                &env,
+                &record.provider,
+                &caller,
+                &Permission::WriteRecord,
+            )
+        };
+
+        if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if record.record_type != RecordType::Examination {
+            return Err(ContractError::InvalidRecordType);
+        }
+
+        let exam = EyeExamination {
+            record_id,
+            visual_acuity,
+            iop,
+            slit_lamp,
+            visual_field,
+            retina_imaging,
+            fundus_photo,
+            clinical_notes,
+        };
+
+        examination::set_examination(&env, &exam);
+        events::publish_examination_added(&env, record_id);
+
+        Ok(())
+    }
+
+    /// Retrieve eye examination details for a record
+    pub fn get_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+    ) -> Result<EyeExamination, ContractError> {
+        caller.require_auth();
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.patient || caller == record.provider {
+            true
+        } else {
+            let access = Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+            access == AccessLevel::Read
+                || access == AccessLevel::Write
+                || access == AccessLevel::Full
+                || rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
+        };
+
+        if !has_perm {
+            return Err(ContractError::AccessDenied);
+        }
+
+        examination::get_examination(&env, record_id).ok_or(ContractError::RecordNotFound)
+    }
+
     /// Get all records for a patient
     pub fn get_patient_records(env: Env, patient: Address) -> Vec<u64> {
         let key = (symbol_short!("PAT_REC"), patient);
@@ -337,6 +540,10 @@ impl VisionRecordsContract {
         level: AccessLevel,
         duration_seconds: u64,
     ) -> Result<(), ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("GRT_ACC")),
+        )?;
         caller.require_auth();
 
         validation::validate_duration(duration_seconds)?;
@@ -370,6 +577,52 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Grant access to multiple users in a single transaction.
+    /// Patient authorizes once for the entire batch.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn grant_access_batch(
+        env: Env,
+        patient: Address,
+        grants: Vec<BatchGrantInput>,
+    ) -> Result<(), ContractError> {
+        patient.require_auth();
+
+        if grants.is_empty() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let now = env.ledger().timestamp();
+        for grant in grants.iter() {
+            let expires_at = now + grant.duration_seconds;
+            let access_grant = AccessGrant {
+                patient: patient.clone(),
+                grantee: grant.grantee.clone(),
+                level: grant.level.clone(),
+                granted_at: now,
+                expires_at,
+            };
+            let key = (
+                symbol_short!("ACCESS"),
+                patient.clone(),
+                grant.grantee.clone(),
+            );
+            env.storage().persistent().set(&key, &access_grant);
+
+            events::publish_access_granted(
+                &env,
+                patient.clone(),
+                grant.grantee.clone(),
+                grant.level.clone(),
+                grant.duration_seconds,
+                expires_at,
+            );
+        }
+
+        events::publish_batch_access_granted(&env, patient, grants.len());
+
+        Ok(())
+    }
+
     /// Check access level
     pub fn check_access(env: Env, patient: Address, grantee: Address) -> AccessLevel {
         let key = (symbol_short!("ACCESS"), patient, grantee);
@@ -389,6 +642,10 @@ impl VisionRecordsContract {
         patient: Address,
         grantee: Address,
     ) -> Result<(), ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REV_ACC")),
+        )?;
         patient.require_auth();
 
         let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
@@ -466,73 +723,16 @@ impl VisionRecordsContract {
         rbac::has_permission(&env, &user, &permission)
     }
 
-    // ======================== ACL Group Endpoints ========================
-
-    pub fn create_acl_group(
-        env: Env,
-        caller: Address,
-        name: String,
-        permissions: Vec<Permission>,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-        rbac::create_group(&env, name, permissions);
-        Ok(())
-    }
-
-    pub fn delete_acl_group(env: Env, caller: Address, name: String) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-        rbac::delete_group(&env, name);
-        Ok(())
-    }
-
-    pub fn add_user_to_group(
-        env: Env,
-        caller: Address,
-        user: Address,
-        group_name: String,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-        rbac::add_to_group(&env, user, group_name).map_err(|_| ContractError::InvalidInput)?;
-        Ok(())
-    }
-
-    pub fn remove_user_from_group(
-        env: Env,
-        caller: Address,
-        user: Address,
-        group_name: String,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-        rbac::remove_from_group(&env, user, group_name);
-        Ok(())
-    }
-
-    pub fn get_user_groups(env: Env, user: Address) -> Vec<String> {
-        env.storage()
-            .persistent()
-            .get(&rbac::user_groups_key(&user))
-            .unwrap_or(Vec::new(&env))
-    }
-
-    pub fn get_acl_group_permissions(env: Env, group_name: String) -> Vec<Permission> {
-        rbac::get_group_permissions(&env, &group_name)
-    }
-}
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
+mod test_pause;
+#[cfg(test)]
 mod test_rbac;
+
+#[cfg(test)]
+mod test_batch;
