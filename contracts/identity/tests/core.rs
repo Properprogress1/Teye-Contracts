@@ -17,24 +17,109 @@ fn test_did_register_and_resolve() {
     assert_eq!(resolved.id, "did:example:123");
 }
 
-#[test]
-fn test_credential_issue_and_verify() {
-    let mut cred = Credential::new("cred1", "did:example:issuer", "did:example:subject");
-    cred.add_claim("name", "Alice");
-    cred.sign(&[0u8; 32]);
-    assert!(cred.verify(&[0u8; 32]));
-}
+// ── Cooldown enforcement ─────────────────────────────────────────────────────
 
 #[test]
-fn test_recovery_flow() {
-    let mut rm = RecoveryManager::default();
-    rm.add_agent(identity::recovery::RecoveryAgent {
-        id: "agent1".into(),
-        contact: "agent@example.com".into(),
+fn test_execute_before_cooldown_fails() {
+    let (env, client, owner) = setup();
+    let (g1, g2, _g3) = add_three_guardians(&env, &client, &owner);
+    let new_address = Address::generate(&env);
+
+    client.set_recovery_threshold(&owner, &2);
+    client.initiate_recovery(&g1, &owner, &new_address);
+    client.approve_recovery(&g2, &owner);
+
+    // Try to execute immediately (before cooldown)
+    let caller = Address::generate(&env);
+    let result = client.try_execute_recovery(&caller, &owner);
+    match result {
+        Err(Ok(e)) => assert_eq!(e, RecoveryError::CooldownNotExpired),
+        _ => panic!("Expected CooldownNotExpired error"),
+    }
+}
+
+// ── Insufficient approvals ───────────────────────────────────────────────────
+
+#[test]
+fn test_execute_insufficient_approvals_fails() {
+    let (env, client, owner) = setup();
+    let (g1, _g2, _g3) = add_three_guardians(&env, &client, &owner);
+    let new_address = Address::generate(&env);
+
+    // Set 3-of-3 threshold
+    client.set_recovery_threshold(&owner, &3);
+
+    // Only one approval
+    client.initiate_recovery(&g1, &owner, &new_address);
+
+    let req = client.get_recovery_request(&owner).unwrap();
+    env.ledger().with_mut(|li| {
+        li.timestamp = req.execute_after + 1;
     });
-    rm.request_recovery("did:example:123", "agent1");
-    let executed = rm.execute_recovery("did:example:123");
-    assert_eq!(executed.unwrap(), "agent1");
+
+    let caller = Address::generate(&env);
+    let result = client.try_execute_recovery(&caller, &owner);
+    match result {
+        Err(Ok(e)) => assert_eq!(e, RecoveryError::InsufficientApprovals),
+        _ => panic!("Expected InsufficientApprovals error"),
+    }
+}
+
+// ── Cancellation ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cancel_recovery() {
+    let (env, client, owner) = setup();
+    let (g1, _g2, _g3) = add_three_guardians(&env, &client, &owner);
+    let new_address = Address::generate(&env);
+
+    client.set_recovery_threshold(&owner, &2);
+    client.initiate_recovery(&g1, &owner, &new_address);
+    assert!(client.get_recovery_request(&owner).is_some());
+
+    // Owner cancels
+    client.cancel_recovery(&owner);
+    assert!(client.get_recovery_request(&owner).is_none());
+
+    // Owner is still active
+    assert!(client.is_owner_active(&owner));
+}
+
+// ── Non-guardian cannot initiate ─────────────────────────────────────────────
+
+#[test]
+fn test_non_guardian_cannot_initiate() {
+    let (env, client, owner) = setup();
+    add_three_guardians(&env, &client, &owner);
+
+    client.set_recovery_threshold(&owner, &2);
+
+    let impostor = Address::generate(&env);
+    let new_address = Address::generate(&env);
+    let result = client.try_initiate_recovery(&impostor, &owner, &new_address);
+    match result {
+        Err(Ok(e)) => assert_eq!(e, RecoveryError::NotAGuardian),
+        _ => panic!("Expected NotAGuardian error"),
+    }
+}
+
+// ── Duplicate approval rejected ──────────────────────────────────────────────
+
+#[test]
+fn test_duplicate_approval_fails() {
+    let (env, client, owner) = setup();
+    let (g1, _g2, _g3) = add_three_guardians(&env, &client, &owner);
+    let new_address = Address::generate(&env);
+
+    client.set_recovery_threshold(&owner, &2);
+    client.initiate_recovery(&g1, &owner, &new_address);
+
+    // Guardian 1 already approved via initiation; second approval should fail
+    let result = client.try_approve_recovery(&g1, &owner);
+    match result {
+        Err(Ok(e)) => assert_eq!(e, RecoveryError::AlreadyApproved),
+        _ => panic!("Expected AlreadyApproved error"),
+    }
 }
 
 // DID format validation tests
