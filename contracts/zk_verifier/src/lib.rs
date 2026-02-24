@@ -62,6 +62,32 @@ pub enum ContractError {
     EmptyPublicInputs = 4,
     TooManyPublicInputs = 5,
     DegenerateProof = 6,
+    /// A proof component is saturated (all 0xFF) — invalid curve encoding.
+    OversizedProofComponent = 7,
+    /// A G1 point has a malformed internal structure (e.g. one coordinate is zero).
+    MalformedG1Point = 8,
+    /// The G2 point has a malformed internal structure (e.g. a limb is zero).
+    MalformedG2Point = 9,
+    /// A public-input element is all zeros.
+    ZeroedPublicInput = 10,
+    /// Cross-contract proof deserialization produced structurally invalid data.
+    MalformedProofData = 11,
+}
+
+/// Map low-level proof validation errors into contract-level errors.
+impl From<ProofValidationError> for ContractError {
+    fn from(e: ProofValidationError) -> Self {
+        match e {
+            ProofValidationError::ZeroedComponent => ContractError::DegenerateProof,
+            ProofValidationError::OversizedComponent => ContractError::OversizedProofComponent,
+            ProofValidationError::MalformedG1PointA | ProofValidationError::MalformedG1PointC => {
+                ContractError::MalformedG1Point
+            }
+            ProofValidationError::MalformedG2Point => ContractError::MalformedG2Point,
+            ProofValidationError::EmptyPublicInputs => ContractError::EmptyPublicInputs,
+            ProofValidationError::ZeroedPublicInput => ContractError::ZeroedPublicInput,
+        }
+    }
 }
 
 #[contract]
@@ -83,6 +109,12 @@ fn is_all_zeros(data: &BytesN<32>) -> bool {
 }
 
 /// Validate request shape before running proof verification.
+///
+/// This performs lightweight structural checks on the `AccessRequest` envelope.
+/// Deeper proof-component validation (zeroed, oversized, malformed coordinates)
+/// is delegated to [`Bn254Verifier::validate_proof_components`] which runs
+/// inside `verify_proof` and returns granular [`ProofValidationError`] variants
+/// that are mapped to [`ContractError`] via the `From` impl.
 fn validate_request(request: &AccessRequest) -> Result<(), ContractError> {
     if request.public_inputs.is_empty() {
         return Err(ContractError::EmptyPublicInputs);

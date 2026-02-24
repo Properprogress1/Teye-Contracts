@@ -27,6 +27,70 @@ pub struct Proof {
 pub struct Bn254Verifier;
 
 impl Bn254Verifier {
+    /// Validate individual proof components for known-bad byte patterns that
+    /// would cause undefined behaviour or nonsensical results in a real pairing
+    /// check.  This runs *before* the (mock) verification arithmetic.
+    pub fn validate_proof_components(
+        proof: &Proof,
+        public_inputs: &Vec<BytesN<32>>,
+    ) -> Result<(), ProofValidationError> {
+        // --- G1 point `a` --------------------------------------------------
+        if is_component_all_zeros(&proof.a) {
+            return Err(ProofValidationError::ZeroedComponent);
+        }
+        if is_component_all_ones(&proof.a) {
+            return Err(ProofValidationError::OversizedComponent);
+        }
+        // Both 32-byte halves of a G1 point must not individually be all-zero
+        // (each half represents a field coordinate).
+        let a_arr = proof.a.to_array();
+        if a_arr[..32].iter().all(|&b| b == 0) || a_arr[32..].iter().all(|&b| b == 0) {
+            return Err(ProofValidationError::MalformedG1PointA);
+        }
+
+        // --- G2 point `b` --------------------------------------------------
+        if is_component_all_zeros(&proof.b) {
+            return Err(ProofValidationError::ZeroedComponent);
+        }
+        if is_component_all_ones(&proof.b) {
+            return Err(ProofValidationError::OversizedComponent);
+        }
+        // G2 is composed of four 32-byte limbs; none may be individually zero.
+        let b_arr = proof.b.to_array();
+        let mut limb_start = 0usize;
+        while limb_start < G2_POINT_LEN {
+            let limb_end = limb_start + 32;
+            if b_arr[limb_start..limb_end].iter().all(|&b| b == 0) {
+                return Err(ProofValidationError::MalformedG2Point);
+            }
+            limb_start = limb_end;
+        }
+
+        // --- G1 point `c` --------------------------------------------------
+        if is_component_all_zeros(&proof.c) {
+            return Err(ProofValidationError::ZeroedComponent);
+        }
+        if is_component_all_ones(&proof.c) {
+            return Err(ProofValidationError::OversizedComponent);
+        }
+        let c_arr = proof.c.to_array();
+        if c_arr[..32].iter().all(|&b| b == 0) || c_arr[32..].iter().all(|&b| b == 0) {
+            return Err(ProofValidationError::MalformedG1PointC);
+        }
+
+        // --- Public inputs --------------------------------------------------
+        if public_inputs.is_empty() {
+            return Err(ProofValidationError::EmptyPublicInputs);
+        }
+        for pi in public_inputs.iter() {
+            if is_component_all_zeros(&pi) {
+                return Err(ProofValidationError::ZeroedPublicInput);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Minimal abstraction for verifying a Groth16 proof over the BN254 curve
     /// using Soroban Wasm primitives. In a production environment this would
     /// utilize a host function or an optimized `#![no_std]` pairing library.

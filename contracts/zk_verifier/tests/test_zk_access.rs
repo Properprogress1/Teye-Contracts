@@ -70,13 +70,19 @@ fn test_valid_proof_verification_and_audit() {
     let user = Address::generate(&env);
     let resource_id = [2u8; 32];
 
-    // Create a mock valid proof (first byte must be 1 for a and c, pi[0] = 1)
+    // Create a mock valid proof (first byte must be 1 for a and c, pi[0] = 1).
+    // Both 32-byte halves of G1 points and all four 32-byte limbs of G2 must be non-zero.
     let mut proof_a = [0u8; 64];
     proof_a[0] = 1;
+    proof_a[32] = 0x02;
     let mut proof_b = [0u8; 128];
-    proof_b[0] = 1; // non-zero so it passes degenerate check
+    proof_b[0] = 1;
+    proof_b[32] = 0x02;
+    proof_b[64] = 0x03;
+    proof_b[96] = 0x04;
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
+    proof_c[32] = 0x02;
     let mut pi = [0u8; 32];
     pi[0] = 1;
 
@@ -124,10 +130,15 @@ fn test_invalid_proof_verification() {
     // so it isn't degenerate)
     let mut proof_a = [0u8; 64];
     proof_a[1] = 0xff; // non-zero byte so not degenerate, but a[0]!=1 → verification fails
+    proof_a[32] = 0x02;
     let mut proof_b = [0u8; 128];
     proof_b[0] = 1;
+    proof_b[32] = 0x02;
+    proof_b[64] = 0x03;
+    proof_b[96] = 0x04;
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
+    proof_c[32] = 0x02;
     let mut pi = [0u8; 32];
     pi[0] = 1;
 
@@ -174,10 +185,15 @@ fn test_rate_limit_enforcement_and_reset() {
 
     let mut proof_a = [0u8; 64];
     proof_a[0] = 1;
+    proof_a[32] = 0x02;
     let mut proof_b = [0u8; 128];
     proof_b[0] = 1;
+    proof_b[32] = 0x02;
+    proof_b[64] = 0x03;
+    proof_b[96] = 0x04;
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
+    proof_c[32] = 0x02;
     let mut pi = [0u8; 32];
     pi[0] = 1;
 
@@ -232,10 +248,15 @@ fn test_whitelist_enforcement_and_toggle() {
     let resource_id = [7u8; 32];
     let mut proof_a = [0u8; 64];
     proof_a[0] = 1;
+    proof_a[32] = 0x02;
     let mut proof_b = [0u8; 128];
     proof_b[0] = 1;
+    proof_b[32] = 0x02;
+    proof_b[64] = 0x03;
+    proof_b[96] = 0x04;
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
+    proof_c[32] = 0x02;
     let mut pi = [0u8; 32];
     pi[0] = 1;
 
