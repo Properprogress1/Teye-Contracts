@@ -84,7 +84,7 @@ fn has_active_consent(env: &Env, patient: &Address, grantee: &Address) -> bool {
     }
 }
 
-pub use rbac::{Permission, Role};
+pub use rbac::{Permission, Role, AccessPolicy, PolicyContext, evaluate_access_policies, set_user_credential, set_record_sensitivity, create_access_policy, CredentialType, SensitivityLevel, TimeRestriction};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -967,17 +967,22 @@ impl VisionRecordsContract {
         Ok(())
     }
 
-    /// Check access level
+    /// Check access level with ABAC policy evaluation
     pub fn check_access(env: Env, patient: Address, grantee: Address) -> AccessLevel {
+        // First check traditional consent-based access
         if !has_active_consent(&env, &patient, &grantee) {
             return AccessLevel::None;
         }
 
-        let key = (symbol_short!("ACCESS"), patient, grantee);
+        let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
 
         if let Some(grant) = env.storage().persistent().get::<_, AccessGrant>(&key) {
             if grant.expires_at > env.ledger().timestamp() {
-                return grant.level;
+                // Check if ABAC policies also allow this access
+                let abac_allowed = evaluate_access_policies(&env, &grantee, None, Some(patient.clone()));
+                if abac_allowed {
+                    return grant.level;
+                }
             }
         }
 
@@ -1542,6 +1547,123 @@ impl VisionRecordsContract {
     /// Returns true if the user has the permission, false otherwise.
     pub fn check_permission(env: Env, user: Address, permission: Permission) -> bool {
         rbac::has_permission(&env, &user, &permission)
+    }
+
+    /// Create an access policy with ABAC attributes
+    pub fn create_access_policy(
+        env: Env,
+        caller: Address,
+        policy_id: String,
+        name: String,
+        required_role: Option<Role>,
+        time_restriction: TimeRestriction,
+        required_credential: CredentialType,
+        min_sensitivity_level: SensitivityLevel,
+        consent_required: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        // Only SystemAdmin can create policies
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let conditions = rbac::PolicyConditions {
+            required_role,
+            time_restriction,
+            required_credential,
+            min_sensitivity_level,
+            consent_required,
+        };
+
+        let policy = rbac::AccessPolicy {
+            id: policy_id.clone(),
+            name,
+            conditions,
+            enabled: true,
+        };
+
+        rbac::create_access_policy(&env, policy);
+        events::publish_policy_created(&env, policy_id, caller);
+
+        Ok(())
+    }
+
+    /// Set credential type for a user
+    pub fn set_user_credential(
+        env: Env,
+        caller: Address,
+        user: Address,
+        credential: CredentialType,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        // Only SystemAdmin can set credentials
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        rbac::set_user_credential(&env, user.clone(), credential);
+        events::publish_credential_set(&env, user, credential, caller);
+
+        Ok(())
+    }
+
+    /// Set sensitivity level for a record
+    pub fn set_record_sensitivity(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+        sensitivity: SensitivityLevel,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        // Only record provider or SystemAdmin can set sensitivity
+        let record_key = (symbol_short!("RECORD"), record_id);
+        let record: VisionRecord = env.storage().persistent().get(&record_key)
+            .ok_or(ContractError::RecordNotFound)?;
+
+        let has_perm = caller == record.provider || rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+        if !has_perm {
+            return Err(ContractError::Unauthorized);
+        }
+
+        rbac::set_record_sensitivity(&env, record_id, sensitivity.clone());
+        events::publish_sensitivity_set(&env, record_id, sensitivity, caller);
+
+        Ok(())
+    }
+
+    /// Check access for a specific record with ABAC evaluation
+    pub fn check_record_access(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+    ) -> Result<AccessLevel, ContractError> {
+        caller.require_auth();
+
+        let record_key = (symbol_short!("RECORD"), record_id);
+        let record: VisionRecord = env.storage().persistent().get(&record_key)
+            .ok_or(ContractError::RecordNotFound)?;
+
+        // Check if caller is patient or provider (always allowed)
+        if caller == record.patient || caller == record.provider {
+            return Ok(AccessLevel::Full);
+        }
+
+        // Check traditional access grants
+        let traditional_access = Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+        if traditional_access != AccessLevel::None {
+            return Ok(traditional_access);
+        }
+
+        // Check ABAC policies for this specific record
+        let abac_allowed = evaluate_access_policies(&env, &caller, Some(record_id), Some(record.patient));
+        if abac_allowed {
+            return Ok(AccessLevel::Read);
+        }
+
+        Ok(AccessLevel::None)
     }
 }
 
