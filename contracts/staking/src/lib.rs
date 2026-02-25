@@ -603,7 +603,7 @@ impl StakingContract {
     ) -> Result<(), ContractError> {
         Self::require_initialized(&env)?;
         caller.require_auth();
-        Self::require_admin_tier(&env, &caller, &AdminTier::ContractAdmin, "set_reward_rate")?;
+        Self::require_admin_tier(&env, &caller, &AdminTier::Contract, "set_reward_rate")?;
 
         if new_rate < 0 {
             return Err(ContractError::InvalidInput);
@@ -683,7 +683,7 @@ impl StakingContract {
     ) -> Result<(), ContractError> {
         Self::require_initialized(&env)?;
         caller.require_auth();
-        Self::require_admin_tier(&env, &caller, &AdminTier::ContractAdmin, "set_lock_period")?;
+        Self::require_admin_tier(&env, &caller, &AdminTier::Contract, "set_lock_period")?;
 
         env.storage().instance().set(&LOCK_PERIOD, &new_period);
 

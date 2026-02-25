@@ -511,7 +511,7 @@ impl VisionRecordsContract {
             return Err(ContractError::InvalidInput);
         }
 
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
+        if !Self::has_admin_access(&env, &caller, &AdminTier::Contract) {
             return Self::unauthorized(
                 &env,
                 &caller,
@@ -574,7 +574,7 @@ impl VisionRecordsContract {
         enabled: bool,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
+        if !Self::has_admin_access(&env, &caller, &AdminTier::Contract) {
             return Self::unauthorized(
                 &env,
                 &caller,
@@ -591,7 +591,7 @@ impl VisionRecordsContract {
     /// Requires at least `ContractAdmin` tier, or legacy admin/SystemAdmin.
     pub fn add_to_whitelist(env: Env, caller: Address, user: Address) -> Result<(), ContractError> {
         caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
+        if !Self::has_admin_access(&env, &caller, &AdminTier::Contract) {
             return Self::unauthorized(
                 &env,
                 &caller,
@@ -612,7 +612,7 @@ impl VisionRecordsContract {
         user: Address,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
+        if !Self::has_admin_access(&env, &caller, &AdminTier::Contract) {
             return Self::unauthorized(
                 &env,
                 &caller,
@@ -2503,3 +2503,6 @@ mod test_batch;
 
 #[cfg(test)]
 mod test_admin_tiers;
+
+#[cfg(test)]
+mod test_occ;

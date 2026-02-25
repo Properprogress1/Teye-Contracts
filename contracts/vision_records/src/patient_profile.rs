@@ -23,6 +23,7 @@ pub struct InsuranceInfo {
 #[allow(clippy::large_enum_variant)]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum OptionalEmergencyContact {
     None,
     Some(EmergencyContact),
@@ -31,6 +32,7 @@ pub enum OptionalEmergencyContact {
 #[allow(clippy::large_enum_variant)]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum OptionalInsuranceInfo {
     None,
     Some(InsuranceInfo),

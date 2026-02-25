@@ -26,9 +26,11 @@ pub mod multisig;
 pub mod pausable;
 pub mod rate_limit;
 pub mod reentrancy_guard;
+pub mod vector_clock;
 pub mod whitelist;
 
 pub use admin_tiers::*;
+pub use concurrency::*;
 #[cfg(feature = "std")]
 pub use consent::*;
 pub use keys::*;
@@ -38,6 +40,7 @@ pub use multisig::*;
 pub use pausable::*;
 pub use rate_limit::*;
 pub use reentrancy_guard::*;
+pub use vector_clock::*;
 pub use whitelist::*;
 
 // ── Shared error enum ────────────────────────────────────────────────────────

@@ -228,6 +228,7 @@ fn test_verify_access_cpu_budget_valid_proof() {
     let request =
         ZkAccessHelper::create_request(&env, user, resource_id, proof_a, proof_b, proof_c, &[&pi]);
 
+    #[allow(deprecated)]
     let mut budget = env.budget();
     budget.reset_default();
     budget.reset_tracker();
@@ -277,6 +278,7 @@ fn test_verify_access_cpu_budget_invalid_proof() {
     let request =
         ZkAccessHelper::create_request(&env, user, resource_id, proof_a, proof_b, proof_c, &[&pi]);
 
+    #[allow(deprecated)]
     let mut budget = env.budget();
     budget.reset_default();
     budget.reset_tracker();
