@@ -1,234 +1,387 @@
 #![no_std]
 
-mod audit;
-mod helpers;
-mod verifier;
+pub mod verifier;
+pub mod audit;
+pub mod helpers;
 
-pub use crate::audit::{AuditRecord, AuditTrail};
-pub use crate::helpers::ZkAccessHelper;
-pub use crate::verifier::{Bn254Verifier, PoseidonHasher, Proof};
+use verifier::{Proof, Bn254Verifier, PoseidonHasher};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec, BytesN};
 
-use common::whitelist;
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
-};
-
-const ADMIN: Symbol = symbol_short!("ADMIN");
-const RATE_CFG: Symbol = symbol_short!("RATECFG");
-const RATE_TRACK: Symbol = symbol_short!("RLTRK");
-
-/// Maximum number of public inputs accepted per proof verification.
-const MAX_PUBLIC_INPUTS: u32 = 16;
-
+/// Verification result storage
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccessRequest {
-    pub user: Address,
-    pub resource_id: BytesN<32>,
+#[derive(Clone, Debug)]
+pub struct VerificationResult {
+    pub proof_id: u64,
+    pub submitter: Address,
+    public_inputs: Vec<BytesN<32>>,
+    verified: bool,
+    timestamp: u64,
+}
+
+/// Preparation data for verification
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareVerification {
+    pub proof_id: u64,
+    pub submitter: Address,
     pub proof: Proof,
     pub public_inputs: Vec<BytesN<32>>,
+    pub timestamp: u64,
 }
 
-/// Contract errors for the ZK verifier.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum ContractError {
-    Unauthorized = 1,
-    RateLimited = 2,
-    InvalidConfig = 3,
-    EmptyPublicInputs = 4,
-    TooManyPublicInputs = 5,
-    DegenerateProof = 6,
-}
+/// Storage keys
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const INITIALIZED: Symbol = symbol_short!("INIT");
+const PROOF_COUNTER: Symbol = symbol_short!("PROOF_CTR");
+const VERIFICATION_RESULTS: Symbol = symbol_short!("VERIFY_RES");
 
 #[contract]
 pub struct ZkVerifierContract;
 
-/// Return `true` if every byte in `data` is zero.
-fn is_all_zeros<const N: usize>(data: &BytesN<N>) -> bool {
-    let arr = data.to_array();
-    let mut all_zero = true;
-    let mut i = 0;
-    while i < N {
-        if arr[i] != 0 {
-            all_zero = false;
-            break;
-        }
-        i += 1;
-    }
-    all_zero
-}
-
-/// Validate request shape before running proof verification.
-fn validate_request(request: &AccessRequest) -> Result<(), ContractError> {
-    if request.public_inputs.is_empty() {
-        return Err(ContractError::EmptyPublicInputs);
-    }
-
-    if request.public_inputs.len() > MAX_PUBLIC_INPUTS {
-        return Err(ContractError::TooManyPublicInputs);
-    }
-
-    if is_all_zeros(&request.proof.a)
-        || is_all_zeros(&request.proof.b)
-        || is_all_zeros(&request.proof.c)
-    {
-        return Err(ContractError::DegenerateProof);
-    }
-
-    Ok(())
-}
-
 #[contractimpl]
 impl ZkVerifierContract {
-    /// One-time initialization to set the admin address.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&ADMIN) {
-            return;
+    /// Initialize the zk verifier contract
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        if env.storage().instance().has(&INITIALIZED) {
+            return Err(ContractError::AlreadyInitialized);
         }
 
-        admin.require_auth();
         env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&INITIALIZED, &true);
+        env.storage().instance().set(&PROOF_COUNTER, &0u64);
+
+        Ok(())
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        caller.require_auth();
+    /// Verify a zero-knowledge proof
+    pub fn verify_proof(
+        env: Env,
+        submitter: Address,
+        proof: Proof,
+        public_inputs: Vec<BytesN<32>>,
+    ) -> Result<u64, ContractError> {
+        Self::require_initialized(&env)?;
+        submitter.require_auth();
 
-        let admin: Address = env
+        // Generate proof ID
+        let proof_id: u64 = env
             .storage()
             .instance()
-            .get(&ADMIN)
-            .ok_or(ContractError::Unauthorized)?;
+            .get(&PROOF_COUNTER)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+        env.storage().instance().set(&PROOF_COUNTER, &proof_id);
 
-        if caller != &admin {
-            return Err(ContractError::Unauthorized);
-        }
+        // Verify the proof
+        let verified = Bn254Verifier::verify_proof(&env, &proof, &public_inputs);
 
-        Ok(())
-    }
-
-    /// Configure per-address rate limiting for this contract.
-    pub fn set_rate_limit_config(
-        env: Env,
-        caller: Address,
-        max_requests_per_window: u64,
-        window_duration_seconds: u64,
-    ) -> Result<(), ContractError> {
-        Self::require_admin(&env, &caller)?;
-
-        if max_requests_per_window == 0 || window_duration_seconds == 0 {
-            return Err(ContractError::InvalidConfig);
-        }
-
-        env.storage().instance().set(
-            &RATE_CFG,
-            &(max_requests_per_window, window_duration_seconds),
-        );
-
-        Ok(())
-    }
-
-    /// Return the current rate limiting configuration, if any.
-    pub fn get_rate_limit_config(env: Env) -> Option<(u64, u64)> {
-        env.storage().instance().get(&RATE_CFG)
-    }
-
-    /// Enables or disables whitelist enforcement.
-    pub fn set_whitelist_enabled(
-        env: Env,
-        caller: Address,
-        enabled: bool,
-    ) -> Result<(), ContractError> {
-        Self::require_admin(&env, &caller)?;
-        whitelist::set_whitelist_enabled(&env, enabled);
-        Ok(())
-    }
-
-    /// Adds an address to the whitelist.
-    pub fn add_to_whitelist(env: Env, caller: Address, user: Address) -> Result<(), ContractError> {
-        Self::require_admin(&env, &caller)?;
-        whitelist::add_to_whitelist(&env, &user);
-        Ok(())
-    }
-
-    /// Removes an address from the whitelist.
-    pub fn remove_from_whitelist(
-        env: Env,
-        caller: Address,
-        user: Address,
-    ) -> Result<(), ContractError> {
-        Self::require_admin(&env, &caller)?;
-        whitelist::remove_from_whitelist(&env, &user);
-        Ok(())
-    }
-
-    pub fn is_whitelist_enabled(env: Env) -> bool {
-        whitelist::is_whitelist_enabled(&env)
-    }
-
-    pub fn is_whitelisted(env: Env, user: Address) -> bool {
-        whitelist::is_whitelisted(&env, &user)
-    }
-
-    fn check_and_update_rate_limit(env: &Env, user: &Address) -> Result<(), ContractError> {
-        let cfg: Option<(u64, u64)> = env.storage().instance().get(&RATE_CFG);
-        let (max_requests_per_window, window_duration_seconds) = match cfg {
-            Some(c) => c,
-            None => return Ok(()),
+        // Store verification result
+        let result = VerificationResult {
+            proof_id,
+            submitter: submitter.clone(),
+            public_inputs: public_inputs.clone(),
+            verified,
+            timestamp: env.ledger().timestamp(),
         };
 
-        if max_requests_per_window == 0 || window_duration_seconds == 0 {
-            return Ok(());
+        let key = (VERIFICATION_RESULTS, proof_id);
+        env.storage().persistent().set(&key, &result);
+
+        // Log the verification
+        audit::log_verification(&env, &submitter, proof_id, verified);
+
+        Ok(proof_id)
+    }
+
+    /// Batch verify multiple proofs
+    pub fn batch_verify_proofs(
+        env: Env,
+        submitter: Address,
+        proofs: Vec<Proof>,
+        public_inputs_batch: Vec<Vec<BytesN<32>>>,
+    ) -> Result<Vec<u64>, ContractError> {
+        Self::require_initialized(&env)?;
+        submitter.require_auth();
+
+        if proofs.len() != public_inputs_batch.len() {
+            return Err(ContractError::InvalidInput);
         }
 
-        let now = env.ledger().timestamp();
-        let key = (RATE_TRACK, user.clone());
-
-        let mut state: (u64, u64) = env.storage().persistent().get(&key).unwrap_or((0, now));
-
-        let window_end = state.1.saturating_add(window_duration_seconds);
-        if now >= window_end {
-            state.0 = 0;
-            state.1 = now;
+        let mut proof_ids = Vec::new(&env);
+        
+        for i in 0..proofs.len() {
+            let proof = proofs.get(i).unwrap().clone();
+            let public_inputs = public_inputs_batch.get(i).unwrap().clone();
+            
+            let proof_id = Self::verify_proof(env.clone(), submitter.clone(), proof, public_inputs)?;
+            proof_ids.push_back(proof_id);
         }
 
-        let next = state.0.saturating_add(1);
-        if next > max_requests_per_window {
-            return Err(ContractError::RateLimited);
+        Ok(proof_ids)
+    }
+
+    /// Get verification result
+    pub fn get_verification_result(env: Env, proof_id: u64) -> Result<VerificationResult, ContractError> {
+        let key = (VERIFICATION_RESULTS, proof_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VerificationNotFound)
+    }
+
+    /// Check if a proof was verified
+    pub fn is_verified(env: Env, proof_id: u64) -> bool {
+        let key = (VERIFICATION_RESULTS, proof_id);
+        if let Some(result) = env.storage().persistent().get::<VerificationResult>(&key) {
+            result.verified
+        } else {
+            false
+        }
+    }
+
+    /// Hash data using Poseidon
+    pub fn hash_data(env: Env, inputs: Vec<BytesN<32>>) -> BytesN<32> {
+        PoseidonHasher::hash(&env, &inputs)
+    }
+
+    /// Get admin address
+    pub fn get_admin(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)
+    }
+
+    /// Check if contract is initialized
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().has(&INITIALIZED)
+    }
+
+    // ======================== Two-Phase Commit Hooks ========================
+
+    /// Prepare phase for proof verification
+    pub fn prepare_verify_proof(
+        env: Env,
+        submitter: Address,
+        proof: Proof,
+        public_inputs: Vec<BytesN<32>>,
+    ) -> Result<u64, ContractError> {
+        Self::require_initialized(&env)?;
+
+        // Validate inputs without making state changes
+        if public_inputs.is_empty() {
+            return Err(ContractError::InvalidInput);
         }
 
-        state.0 = next;
-        env.storage().persistent().set(&key, &state);
+        // Generate proof ID
+        let proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&PROOF_COUNTER)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        // Store preparation data
+        let prep_key = (symbol_short!("PREP_VERIFY"), proof_id);
+        let prep_data = PrepareVerification {
+            proof_id,
+            submitter: submitter.clone(),
+            proof: proof.clone(),
+            public_inputs: public_inputs.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(proof_id)
+    }
+
+    /// Commit phase for proof verification
+    pub fn commit_verify_proof(
+        env: Env,
+        proof_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_VERIFY"), proof_id);
+        let prep_data: PrepareVerification = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Update the counter
+        env.storage().instance().set(&PROOF_COUNTER, &proof_id);
+
+        // Verify the proof
+        let verified = Bn254Verifier::verify_proof(&env, &prep_data.proof, &prep_data.public_inputs);
+
+        // Store verification result
+        let result = VerificationResult {
+            proof_id,
+            submitter: prep_data.submitter.clone(),
+            public_inputs: prep_data.public_inputs.clone(),
+            verified,
+            timestamp: prep_data.timestamp,
+        };
+
+        let key = (VERIFICATION_RESULTS, proof_id);
+        env.storage().persistent().set(&key, &result);
+
+        // Log the verification
+        audit::log_verification(&env, &prep_data.submitter, proof_id, verified);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
 
         Ok(())
     }
 
-    pub fn verify_access(env: Env, request: AccessRequest) -> Result<bool, ContractError> {
-        request.user.require_auth();
+    /// Rollback phase for proof verification
+    pub fn rollback_verify_proof(
+        env: Env,
+        proof_id: u64,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_VERIFY"), proof_id);
+        env.storage().temporary().remove(&prep_key);
 
-        validate_request(&request)?;
-
-        if !whitelist::check_whitelist_access(&env, &request.user) {
-            return Err(ContractError::Unauthorized);
-        }
-
-        Self::check_and_update_rate_limit(&env, &request.user)?;
-
-        let is_valid = Bn254Verifier::verify_proof(&env, &request.proof, &request.public_inputs);
-        if is_valid {
-            let proof_hash = PoseidonHasher::hash(&env, &request.public_inputs);
-            AuditTrail::log_access(&env, request.user, request.resource_id, proof_hash);
-        }
-        Ok(is_valid)
+        Ok(())
     }
 
-    pub fn get_audit_record(
+    /// Prepare phase for batch verification
+    pub fn prepare_batch_verify_proofs(
         env: Env,
-        user: Address,
-        resource_id: BytesN<32>,
-    ) -> Option<AuditRecord> {
-        AuditTrail::get_record(&env, user, resource_id)
+        submitter: Address,
+        proofs: Vec<Proof>,
+        public_inputs_batch: Vec<Vec<BytesN<32>>>,
+    ) -> Result<Vec<u64>, ContractError> {
+        Self::require_initialized(&env)?;
+
+        if proofs.len() != public_inputs_batch.len() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let mut proof_ids = Vec::new(&env);
+        let mut start_proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&PROOF_COUNTER)
+            .unwrap_or(0u64);
+
+        // Validate all inputs and generate IDs
+        for i in 0..proofs.len() {
+            let public_inputs = public_inputs_batch.get(i).unwrap().clone();
+            
+            if public_inputs.is_empty() {
+                return Err(ContractError::InvalidInput);
+            }
+
+            start_proof_id = start_proof_id.saturating_add(1);
+            proof_ids.push_back(start_proof_id);
+
+            // Store preparation data for each proof
+            let prep_key = (symbol_short!("PREP_BATCH_VERIFY"), start_proof_id);
+            let prep_data = PrepareVerification {
+                proof_id: start_proof_id,
+                submitter: submitter.clone(),
+                proof: proofs.get(i).unwrap().clone(),
+                public_inputs,
+                timestamp: env.ledger().timestamp(),
+            };
+            env.storage().temporary().set(&prep_key, &prep_data);
+        }
+
+        Ok(proof_ids)
+    }
+
+    /// Commit phase for batch verification
+    pub fn commit_batch_verify_proofs(
+        env: Env,
+        proof_ids: Vec<u64>,
+    ) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        let mut max_proof_id = 0u64;
+
+        // Commit each verification
+        for proof_id in proof_ids {
+            max_proof_id = max_proof_id.max(proof_id);
+            
+            // Retrieve preparation data
+            let prep_key = (symbol_short!("PREP_BATCH_VERIFY"), proof_id);
+            let prep_data: PrepareVerification = env.storage().temporary()
+                .get(&prep_key)
+                .ok_or(ContractError::InvalidInput)?;
+
+            // Verify the proof
+            let verified = Bn254Verifier::verify_proof(&env, &prep_data.proof, &prep_data.public_inputs);
+
+            // Store verification result
+            let result = VerificationResult {
+                proof_id,
+                submitter: prep_data.submitter.clone(),
+                public_inputs: prep_data.public_inputs.clone(),
+                verified,
+                timestamp: prep_data.timestamp,
+            };
+
+            let key = (VERIFICATION_RESULTS, proof_id);
+            env.storage().persistent().set(&key, &result);
+
+            // Log the verification
+            audit::log_verification(&env, &prep_data.submitter, proof_id, verified);
+
+            // Clean up preparation data
+            env.storage().temporary().remove(&prep_key);
+        }
+
+        // Update the counter to the highest proof ID
+        env.storage().instance().set(&PROOF_COUNTER, &max_proof_id);
+
+        Ok(())
+    }
+
+    /// Rollback phase for batch verification
+    pub fn rollback_batch_verify_proofs(
+        env: Env,
+        proof_ids: Vec<u64>,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data for all proofs
+        for proof_id in proof_ids {
+            let prep_key = (symbol_short!("PREP_BATCH_VERIFY"), proof_id);
+            env.storage().temporary().remove(&prep_key);
+        }
+
+        Ok(())
+    }
+
+    // Helper functions
+    fn require_initialized(env: &Env) -> Result<(), ContractError> {
+        if !env.storage().instance().has(&INITIALIZED) {
+            Err(ContractError::NotInitialized)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+    AlreadyInitialized,
+    NotInitialized,
+    InvalidInput,
+    VerificationNotFound,
+    Unauthorized,
+}
+
+impl From<ContractError> for u32 {
+    fn from(error: ContractError) -> u32 {
+        match error {
+            ContractError::AlreadyInitialized => 1001,
+            ContractError::NotInitialized => 1002,
+            ContractError::InvalidInput => 1003,
+            ContractError::VerificationNotFound => 1004,
+            ContractError::Unauthorized => 1005,
+        }
     }
 }

@@ -9,6 +9,15 @@ pub struct AuditRecord {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationRecord {
+    pub submitter: Address,
+    pub proof_id: u64,
+    pub verified: bool,
+    pub timestamp: u64,
+}
+
 pub struct AuditTrail;
 
 impl AuditTrail {
@@ -27,5 +36,18 @@ impl AuditTrail {
 
     pub fn get_record(env: &Env, user: Address, resource_id: BytesN<32>) -> Option<AuditRecord> {
         env.storage().persistent().get(&(&user, &resource_id))
+    }
+
+    pub fn log_verification(env: &Env, submitter: &Address, proof_id: u64, verified: bool) {
+        let record = VerificationRecord {
+            submitter: submitter.clone(),
+            proof_id,
+            verified,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&("verification", proof_id), &record);
+        env.events().publish(("verification", proof_id), (submitter, verified));
     }
 }

@@ -98,14 +98,67 @@ pub enum ConsentType {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessLevel {
-    /// No access to the record
     None,
-    /// Read-only access to the record
     Read,
-    /// Write access to the record
     Write,
-    /// Full access including read, write, and delete
-    Full,
+    Admin,
+}
+
+/// Preparation data for user registration
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareUserRegistration {
+    pub caller: Address,
+    pub user: Address,
+    pub role: Role,
+    pub name: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for record addition
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareRecordAddition {
+    pub caller: Address,
+    pub patient: Address,
+    pub provider: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for adding a vision record
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareAddRecord {
+    pub caller: Address,
+    pub patient: Address,
+    pub provider: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for granting access
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareGrantAccess {
+    pub caller: Address,
+    pub patient: Address,
+    pub grantee: Address,
+    pub access_level: AccessLevel,
+    pub expires_at: Option<u64>,
+    pub timestamp: u64,
+}
+
+/// Preparation data for adding a prescription
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareAddPrescription {
+    pub patient: Address,
+    pub provider: Address,
+    pub prescription_data: prescription::PrescriptionData,
+    pub timestamp: u64,
 }
 
 /// Vision record types
@@ -1664,6 +1717,532 @@ impl VisionRecordsContract {
         }
 
         Ok(AccessLevel::None)
+    }
+
+    /// Prepare phase for register_user operation
+    pub fn prepare_register_user(
+        env: Env,
+        caller: Address,
+        user: Address,
+        role: Role,
+        name: String,
+    ) -> Result<(), ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REG_USR")),
+        )?;
+
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        validation::validate_name(&name)?;
+
+        // Check if user already exists
+        let key = (symbol_short!("USER"), user.clone());
+        if env.storage().persistent().get::<_, User>(&key).is_some() {
+            return Err(ContractError::UserAlreadyExists);
+        }
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        let prep_data = PrepareUserRegistration {
+            caller: caller.clone(),
+            user: user.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for register_user operation
+    pub fn commit_register_user(
+        env: Env,
+        caller: Address,
+        user: Address,
+        role: Role,
+        name: String,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        let prep_data: PrepareUserRegistration = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidPhase)?;
+
+        // Verify preparation data matches commit parameters
+        if prep_data.caller != caller || prep_data.user != user || 
+           prep_data.role != role || prep_data.name != name {
+            return Err(ContractError::InvalidPhase);
+        }
+
+        // Execute the actual registration
+        let user_data = User {
+            address: user.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            registered_at: env.ledger().timestamp(),
+            is_active: true,
+        };
+
+        let key = (symbol_short!("USER"), user.clone());
+        env.storage().persistent().set(&key, &user_data);
+        extend_ttl_address_key(&env, &key);
+        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        events::publish_user_registered(&env, user, role, name);
+
+        Ok(())
+    }
+
+    /// Rollback for register_user operation
+    pub fn rollback_register_user(
+        env: Env,
+        user: Address,
+        _role: Role,
+        _name: String,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Prepare phase for add_record operation
+    pub fn prepare_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<(), ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
+
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Verify provider permissions
+        if !rbac::has_permission(&env, &provider, &Permission::CreateRecords) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Validate inputs
+        validation::validate_address(&patient)?;
+        validation::validate_address(&provider)?;
+        validation::validate_hash(&data_hash)?;
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), provider.clone(), env.ledger().timestamp());
+        let prep_data = PrepareRecordAddition {
+            caller: caller.clone(),
+            patient: patient.clone(),
+            provider: provider.clone(),
+            record_type: record_type.clone(),
+            data_hash: data_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for add_record operation
+    pub fn commit_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<u64, ContractError> {
+        // Retrieve preparation data using timestamp lookup
+        let prep_keys = env.storage().temporary().range::<_, PrepareRecordAddition>();
+        let mut prep_data: Option<PrepareRecordAddition> = None;
+        let mut prep_key_to_remove: Option<(Symbol, Address, u64)> = None;
+
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.caller == caller && data.patient == patient && 
+                   data.provider == provider && data.record_type == record_type && 
+                   data.data_hash == data_hash {
+                    prep_data = Some(data);
+                    prep_key_to_remove = Some(key);
+                    break;
+                }
+            }
+        }
+
+        let prep_data = prep_data.ok_or(ContractError::InvalidPhase)?;
+
+        // Execute the actual record addition
+        let record_id = increment_record_counter(&env);
+        let record = VisionRecord {
+            id: record_id,
+            patient: patient.clone(),
+            provider: provider.clone(),
+            record_type: record_type.clone(),
+            data_hash: data_hash.clone(),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            access_count: 0,
+        };
+
+        let key = (symbol_short!("RECORD"), record_id);
+        env.storage().persistent().set(&key, &record);
+        extend_ttl_record_key(&env, &key);
+
+        // Clean up preparation data
+        if let Some(key) = prep_key_to_remove {
+            env.storage().temporary().remove(&key);
+        }
+
+        events::publish_record_added(&env, record_id, patient, provider, record_type);
+
+        Ok(record_id)
+    }
+
+    /// Rollback for add_record operation
+    pub fn rollback_add_record(
+        env: Env,
+        _caller: Address,
+        _patient: Address,
+        provider: Address,
+        _record_type: RecordType,
+        _data_hash: String,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data for this provider
+        let prep_keys = env.storage().temporary().range::<_, PrepareRecordAddition>();
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.provider == provider {
+                    env.storage().temporary().remove(&key);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ======================== Two-Phase Commit Hooks ========================
+
+    /// Prepare phase for adding a vision record
+    pub fn prepare_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<u64, ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
+
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        Self::enforce_rate_limit(&env, &caller)?;
+        validation::validate_data_hash(&data_hash)?;
+
+        // Check permissions
+        let has_perm = if caller == provider {
+            rbac::has_permission(&env, &caller, &Permission::WriteRecord)
+        } else {
+            rbac::has_delegated_permission(&env, &provider, &caller, &Permission::WriteRecord)
+        };
+
+        if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Generate and return the record ID that will be used
+        let counter_key = symbol_short!("REC_CTR");
+        let record_id: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        // Store preparation data temporarily
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        let prep_data = PrepareAddRecord {
+            caller,
+            patient,
+            provider,
+            record_type,
+            data_hash,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(record_id)
+    }
+
+    /// Commit phase for adding a vision record
+    pub fn commit_add_record(
+        env: Env,
+        record_id: u64,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        let prep_data: PrepareAddRecord = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Update the counter
+        let counter_key = symbol_short!("REC_CTR");
+        env.storage().instance().set(&counter_key, &record_id);
+
+        // Create the actual record
+        let record = VisionRecord {
+            id: record_id,
+            patient: prep_data.patient.clone(),
+            provider: prep_data.provider.clone(),
+            record_type: prep_data.record_type.clone(),
+            data_hash: prep_data.data_hash.clone(),
+            created_at: prep_data.timestamp,
+            updated_at: prep_data.timestamp,
+        };
+
+        // Store the record
+        let key = (symbol_short!("RECORD"), record_id);
+        env.storage().persistent().set(&key, &record);
+        extend_ttl_u64_key(&env, &key);
+
+        // Add to patient's record list
+        let patient_key = (symbol_short!("PAT_REC"), prep_data.patient.clone());
+        let mut patient_records: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&patient_key)
+            .unwrap_or(Vec::new(&env));
+        patient_records.push_back(record_id);
+        env.storage()
+            .persistent()
+            .set(&patient_key, &patient_records);
+        extend_ttl_address_key(&env, &patient_key);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback phase for adding a vision record
+    pub fn rollback_add_record(
+        env: Env,
+        record_id: u64,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Prepare phase for granting access
+    pub fn prepare_grant_access(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        grantee: Address,
+        access_level: AccessLevel,
+        expires_at: Option<u64>,
+    ) -> Result<(), ContractError> {
+        // Validate inputs without state changes
+        if caller != patient && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if access_level == AccessLevel::None {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Store preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        let prep_data = PrepareGrantAccess {
+            caller,
+            patient,
+            grantee,
+            access_level,
+            expires_at,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for granting access
+    pub fn commit_grant_access(
+        env: Env,
+        patient: Address,
+        grantee: Address,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        let prep_data: PrepareGrantAccess = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Create the access grant
+        let grant = AccessGrant {
+            patient: prep_data.patient.clone(),
+            grantee: prep_data.grantee.clone(),
+            level: prep_data.access_level,
+            granted_at: prep_data.timestamp,
+            expires_at: prep_data.expires_at.unwrap_or(0),
+        };
+
+        // Store the grant
+        let key = (symbol_short!("GRANT"), prep_data.patient.clone(), prep_data.grantee.clone());
+        env.storage().persistent().set(&key, &grant);
+        extend_ttl_address_key(&env, &key);
+
+        // Add to patient's grants list
+        let grants_key = (symbol_short!("GRANTS"), prep_data.patient.clone());
+        let mut grants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&grants_key)
+            .unwrap_or(Vec::new(&env));
+        
+        if !grants.contains(&prep_data.grantee) {
+            grants.push_back(prep_data.grantee.clone());
+            env.storage().persistent().set(&grants_key, &grants);
+            extend_ttl_address_key(&env, &grants_key);
+        }
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback phase for granting access
+    pub fn rollback_grant_access(
+        env: Env,
+        patient: Address,
+        grantee: Address,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Prepare phase for adding a prescription
+    pub fn prepare_add_prescription(
+        env: Env,
+        patient: Address,
+        provider: Address,
+        prescription_data: prescription::PrescriptionData,
+    ) -> Result<u64, ContractError> {
+        // Validate without state changes
+        validation::validate_prescription_data(&prescription_data)?;
+
+        // Check provider permissions
+        let caller = provider.clone();
+        let has_perm = rbac::has_permission(&env, &caller, &Permission::WriteRecord) ||
+                      rbac::has_delegated_permission(&env, &provider, &caller, &Permission::WriteRecord) ||
+                      rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+
+        if !has_perm {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Generate prescription ID
+        let counter_key = symbol_short!("RX_CTR");
+        let rx_id: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        // Store preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        let prep_data = PrepareAddPrescription {
+            patient,
+            provider,
+            prescription_data,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(rx_id)
+    }
+
+    /// Commit phase for adding a prescription
+    pub fn commit_add_prescription(
+        env: Env,
+        rx_id: u64,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        let prep_data: PrepareAddPrescription = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Update counter
+        let counter_key = symbol_short!("RX_CTR");
+        env.storage().instance().set(&counter_key, &rx_id);
+
+        // Create the prescription
+        let prescription = prescription::Prescription {
+            id: rx_id,
+            patient: prep_data.patient.clone(),
+            provider: prep_data.provider.clone(),
+            data: prep_data.prescription_data.clone(),
+            created_at: prep_data.timestamp,
+            verified: false,
+        };
+
+        // Store the prescription
+        let key = (symbol_short!("PRESCRIPTION"), rx_id);
+        env.storage().persistent().set(&key, &prescription);
+        extend_ttl_u64_key(&env, &key);
+
+        // Add to patient's prescription history
+        prescription::add_to_patient_history(&env, prep_data.patient.clone(), rx_id);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback phase for adding a prescription
+    pub fn rollback_add_prescription(
+        env: Env,
+        rx_id: u64,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
     }
 }
 

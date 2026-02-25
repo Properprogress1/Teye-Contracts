@@ -9,6 +9,7 @@ pub mod meta_tx;
 pub mod multisig;
 pub mod rate_limit;
 pub mod whitelist;
+pub mod transaction;
 
 #[cfg(feature = "std")]
 pub use consent::*;
@@ -19,3 +20,4 @@ pub use meta_tx::*;
 pub use multisig::*;
 pub use rate_limit::*;
 pub use whitelist::*;
+pub use transaction::*;

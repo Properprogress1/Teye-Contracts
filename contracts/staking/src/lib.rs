@@ -5,10 +5,28 @@ pub mod rewards;
 pub mod timelock;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, String,
 };
 
 use timelock::UnstakeRequest;
+
+/// Preparation data for staking operation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareStake {
+    pub staker: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Preparation data for withdrawal operation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareWithdraw {
+    pub staker: Address,
+    pub request_id: u64,
+    pub timestamp: u64,
+}
 
 // ── Storage key constants ────────────────────────────────────────────────────
 
@@ -521,6 +539,148 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&(USER_RPT_PAID, user.clone()), &current_rpt);
+    }
+
+    // ===== Two-Phase Commit Hooks =====
+
+    /// Prepare phase for stake operation
+    pub fn prepare_stake(env: Env, staker: Address, amount: i128) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+        
+        // Validate all inputs without making state changes
+        if amount <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Check if staker has sufficient balance (without actually transferring)
+        let stake_token: Address = env.storage().instance().get(&STAKE_TOKEN)
+            .ok_or(ContractError::NotInitialized)?;
+        
+        let balance = token::Client::new(&env, &stake_token).balance(&staker);
+        if balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_STAKE"), staker.clone(), env.ledger().timestamp());
+        let prep_data = PrepareStake {
+            staker: staker.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for stake operation
+    pub fn commit_stake(env: Env, staker: Address, amount: i128) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+        
+        // Retrieve preparation data
+        let prep_keys = env.storage().temporary().range::<_, PrepareStake>();
+        let mut prep_data: Option<PrepareStake> = None;
+        let mut prep_key_to_remove: Option<(Symbol, Address, u64)> = None;
+
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.staker == staker && data.amount == amount {
+                    prep_data = Some(data);
+                    prep_key_to_remove = Some(key);
+                    break;
+                }
+            }
+        }
+
+        let prep_data = prep_data.ok_or(ContractError::InvalidInput)?;
+
+        // Execute the actual staking
+        Self::stake(env, staker.clone(), amount)?;
+
+        // Clean up preparation data
+        if let Some(key) = prep_key_to_remove {
+            env.storage().temporary().remove(&key);
+        }
+
+        Ok(())
+    }
+
+    /// Rollback for stake operation
+    pub fn rollback_stake(env: Env, staker: Address, _amount: i128) -> Result<(), ContractError> {
+        // Clean up preparation data for this staker
+        let prep_keys = env.storage().temporary().range::<_, PrepareStake>();
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.staker == staker {
+                    env.storage().temporary().remove(&key);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Prepare phase for withdraw operation
+    pub fn prepare_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+        
+        // Validate all inputs without making state changes
+        let request_key = (symbol_short!("UNSTAKE_REQ"), staker.clone(), request_id);
+        let request: UnstakeRequest = env.storage().persistent().get(&request_key)
+            .ok_or(ContractError::RequestNotFound)?;
+
+        // Check if timelock has expired
+        if request.unlock_at > env.ledger().timestamp() {
+            return Err(ContractError::TimelockNotExpired);
+        }
+
+        // Check if already withdrawn
+        if request.withdrawn {
+            return Err(ContractError::AlreadyWithdrawn);
+        }
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_WITHDRAW"), staker.clone(), request_id);
+        let prep_data = PrepareWithdraw {
+            staker: staker.clone(),
+            request_id,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for withdraw operation
+    pub fn commit_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+        
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_WITHDRAW"), staker.clone(), request_id);
+        let prep_data: PrepareWithdraw = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Verify preparation data matches commit parameters
+        if prep_data.staker != staker || prep_data.request_id != request_id {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Execute the actual withdrawal
+        Self::withdraw(env, staker.clone(), request_id)?;
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback for withdraw operation
+    pub fn rollback_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_WITHDRAW"), staker, request_id);
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
     }
 }
 
