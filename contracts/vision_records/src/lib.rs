@@ -505,7 +505,7 @@ impl VisionRecordsContract {
         caller: Address,
         max_requests_per_window: u64,
         window_duration_seconds: u64,
-        proposal_id: u64,
+        _proposal_id: u64,
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
@@ -537,7 +537,7 @@ impl VisionRecordsContract {
         caller: Address,
         version: String,
         key: String,
-        proposal_id: u64,
+        _proposal_id: u64,
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
@@ -1480,6 +1480,17 @@ impl VisionRecordsContract {
 
         let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
         env.storage().persistent().remove(&key);
+
+        let revoked_delegations = rbac::revoke_delegations_from(&env, &grantee);
+        for revoked in revoked_delegations.iter() {
+            events::publish_cascading_revocation(
+                &env,
+                patient.clone(),
+                grantee.clone(),
+                revoked.delegatee.clone(),
+                revoked.is_scoped,
+            );
+        }
 
         // Log successful access revoke
         let audit_entry = audit::create_audit_entry(
